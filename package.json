@@ -1,0 +1,22 @@
+{
+  "name": "cattle-trace",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.20.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  },
+  "description": "EUDR-konforme Rinder-Lieferkette auf Midnight (Compact) \u2013 Open-Source-Referenz",
+  "license": "Apache-2.0",
+  "scripts": {
+    "compile": "compact compile src/CattleTrace.compact build",
+    "compile:fast": "compact compile --skip-zk src/CattleTrace.compact build",
+    "test": "tsx test/simulation.test.ts",
+    "typecheck": "tsc"
+  }
+}

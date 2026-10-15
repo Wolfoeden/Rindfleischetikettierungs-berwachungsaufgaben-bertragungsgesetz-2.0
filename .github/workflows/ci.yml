@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      COMPACTC_VERSION: "0.35.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Compact-Compiler installieren
+        run: |
+          curl -sSL -o compactc.zip \
+            "https://github.com/midnightntwrk/compact/releases/download/compactc-v${COMPACTC_VERSION}/compactc_v${COMPACTC_VERSION}_x86_64-unknown-linux-musl.zip"
+          mkdir -p "$HOME/compactc" && unzip -q compactc.zip -d "$HOME/compactc"
+          echo "$HOME/compactc" >> "$GITHUB_PATH"
+
+      - name: Contract kompilieren (ohne ZK-Schluessel)
+        run: compactc --skip-zk src/CattleTrace.compact build
+
+      - name: Abhaengigkeiten installieren
+        run: npm install
+
+      - name: Typ-Check
+        run: npm run typecheck
+
+      - name: Simulation
+        run: npm test

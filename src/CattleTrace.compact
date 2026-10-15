@@ -1,0 +1,417 @@
+// =============================================================================
+//  CattleTrace.compact — EUDR-konforme Rinder-Lieferkette auf Midnight
+//  Referenz-Implementierung · Apache-2.0
+//
+//  Getestet mit: compactc 0.35.0, Compact-Sprache 0.27.0
+//
+//  Fachlicher Rahmen
+//  -----------------
+//  * EUDR (VO (EU) 2023/1115 i.d.F. VO (EU) 2025/2650): Rinder sind ein
+//    relevanter Rohstoff. Geolokalisierung = ALLE Betriebe, in denen das Tier
+//    gehalten wurde (nicht Felder). Erzeugnis muss entwaldungsfrei UND legal
+//    nach dem Recht des Erzeugerlandes produziert sein (Art. 3).
+//  * GS1 EPCIS 2.0: Jede Zustandsänderung entspricht einem EPCIS-Event
+//    (WHAT = batchId, WHEN = Blockzeit, WHERE = Betrieb (privat!),
+//     WHY = bizStep / status). Die vollständigen EPCIS-Events liegen in
+//    einem EPCIS-Repository off-chain; hier wird nur das verankert, was
+//    Dritte vertrauenswürdig prüfen müssen.
+//
+//  Datenschutz-Modell (das Kernprinzip von Midnight)
+//  ------------------------------------------------
+//  * Alles, was mit `export ledger` deklariert ist, ist ÖFFENTLICH.
+//  * Alles, was über `witness` hereinkommt, ist PRIVAT und verlässt das Gerät
+//    des Nutzers nur als Zero-Knowledge-Beweis.
+//  * Der Compiler verweigert jeden Fluss von privat -> öffentlich, der nicht
+//    ausdrücklich mit `disclose(...)` markiert ist. Jedes `disclose` in dieser
+//    Datei ist deshalb eine bewusste, dokumentierte Datenschutz-Entscheidung.
+// =============================================================================
+
+pragma language_version >= 0.27;
+
+import CompactStandardLibrary;
+
+// -----------------------------------------------------------------------------
+//  Konstanten
+// -----------------------------------------------------------------------------
+
+// Maximale Anzahl Haltungsbetriebe pro Charge, die in einem Beweis geprüft
+// werden. ZK-Circuits haben feste Größe; 4 deckt den typischen deutschen
+// Fall ab (Geburtsbetrieb -> Aufzucht -> Mast -> ggf. Sammelstelle).
+// Für mehr Betriebe: Konstante erhöhen (Beweis wird größer) oder rekursiv
+// über Teilbeweise arbeiten.
+// (In Compact sind Vektorgrößen Literale; die 4 taucht daher unten direkt auf.)
+
+// Tiefe des Merkle-Baums für Prüfstellen-Bestätigungen: 2^16 = 65.536
+// Einträge. Für den Produktivbetrieb ggf. auf 20 erhöhen.
+
+// Temperaturkodierung: Compact kennt keine negativen Ganzzahlen.
+// Wir kodieren Temperatur als (°C * 100) + 10000.
+//   -18,00 °C -> 8200     0,00 °C -> 10000     7,00 °C -> 10700
+// Grenzwerte nach VO (EG) 853/2004, Anhang III:
+//   frisches Fleisch <= 7 °C, Nebenprodukte <= 3 °C.
+
+// -----------------------------------------------------------------------------
+//  Typen
+// -----------------------------------------------------------------------------
+
+// Öffentlicher Status (EPCIS bizStep in Klammern)
+export enum Status {
+  HARVESTED,   // Erfassung/Schlachtung als Erzeugnis (commissioning)
+  IN_TRANSIT,  // Versand an nächsten Halter            (shipping)
+  DELIVERED    // Empfang bestätigt                     (receiving)
+}
+
+// Ein Haltungsbetrieb — PRIVAT. Verlässt nie das Gerät des Erzeugers.
+export struct Establishment {
+  active: Boolean;          // false = Slot ungenutzt
+  hitRegNumber: Bytes<32>;  // Registriernummer in der HI-Tier-Datenbank
+  geoHash: Bytes<32>;       // Hash des GeoJSON-Polygons / Koordinatenpunkts
+}
+
+// Alle privaten Daten einer Charge. On-chain liegt nur ein Commitment davon.
+export struct BatchSecrets {
+  establishments: Vector<4, Establishment>;
+  netWeightKg: Uint<32>;           // exakte Menge — PRIVAT
+  purchasePriceCents: Uint<64>;    // Einkaufspreis — PRIVAT
+  supplierRef: Bytes<32>;          // interne Lieferanten-ID — PRIVAT
+}
+
+// Was eine akkreditierte Prüfstelle über EINEN Betrieb bestätigt.
+// Die Prüfstelle sieht die Geodaten (das ist ihr Job, z. B. Abgleich mit
+// Satellitendaten / EU-Waldkarte), veröffentlicht aber nur ein Commitment.
+export struct EstablishmentClaim {
+  hitRegNumber: Bytes<32>;
+  geoHash: Bytes<32>;
+  deforestationFree: Boolean;  // keine Entwaldung nach dem 31.12.2020
+  legallyProduced: Boolean;    // Art. 3 b) EUDR
+  validUntil: Uint<64>;        // Unix-Sekunden
+}
+
+// Ein vom Telematik-Anbieter signierter Messwert
+export struct TemperatureReading {
+  tempEncoded: Uint<32>;   // siehe Kodierung oben
+  timestamp: Uint<64>;
+}
+
+// -----------------------------------------------------------------------------
+//  ÖFFENTLICHER ZUSTAND (für jeden sichtbar)
+// -----------------------------------------------------------------------------
+
+// Governance: Hash des Admin-Schlüssels (Konsortium, idealerweise Multisig)
+export ledger admin: Bytes<32>;
+
+// Zugelassene Prüfstellen (Hash ihres öffentlichen Schlüssels)
+export ledger verifiers: Set<Bytes<32>>;
+
+// Zugelassene Telematik-Signaturschlüssel (Schnorr über Jubjub)
+export ledger oracleKeys: Map<Bytes<32>, JubjubPoint>;
+
+// Commitments auf Prüfstellen-Bestätigungen. "Historic", damit Beweise gegen
+// einen kurz zuvor gültigen Wurzelhash nicht durch neue Einträge ungültig
+// werden.
+export ledger attestations: HistoricMerkleTree<16, Bytes<32>>;
+
+// --- Chargen-Register, Schlüssel = batchId (SSCC/GTIN+Los, auf 32 Byte) ---
+export ledger status: Map<Bytes<32>, Status>;
+export ledger holder: Map<Bytes<32>, Bytes<32>>;            // Pseudonym
+export ledger pendingRecipient: Map<Bytes<32>, Bytes<32>>;
+export ledger isQualityCertified: Map<Bytes<32>, Boolean>;
+export ledger tempThreshold: Map<Bytes<32>, Uint<32>>;
+export ledger secretsCommitment: Map<Bytes<32>, Bytes<32>>;  // bindet Privatdaten
+export ledger ddsCommitment: Map<Bytes<32>, Bytes<32>>;      // EU-DDS-Referenz
+export ledger eudrProven: Map<Bytes<32>, Boolean>;
+export ledger eudrProvenAsOf: Map<Bytes<32>, Uint<64>>;
+export ledger minWeightProven: Map<Bytes<32>, Uint<32>>;
+
+// -----------------------------------------------------------------------------
+//  WITNESSES — die Brücke zu PRIVATEN Daten
+//  Implementiert in TypeScript (witnesses.ts), läuft lokal beim Nutzer.
+//  Nichts davon landet on-chain, außer es wird explizit disclosed.
+// -----------------------------------------------------------------------------
+
+witness localSecretKey(): Bytes<32>;
+witness batchSecrets(batchId: Bytes<32>): BatchSecrets;
+witness batchSalt(batchId: Bytes<32>): Bytes<32>;
+witness attestationSalt(batchId: Bytes<32>, slot: Uint<8>): Bytes<32>;
+witness attestationClaim(batchId: Bytes<32>, slot: Uint<8>): EstablishmentClaim;
+witness attestationPath(leaf: Bytes<32>): MerkleTreePath<16, Bytes<32>>;
+
+// -----------------------------------------------------------------------------
+//  Hilfs-Circuits (nicht exportiert -> nicht direkt aufrufbar)
+// -----------------------------------------------------------------------------
+
+// Rollen-Schlüssel (Admin, Prüfstelle): bewusst stabil und wiedererkennbar.
+circuit roleKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "agri:role:pk"), sk]);
+}
+
+// Halter-Pseudonym PRO CHARGE. Weil batchId mit einfließt, kann niemand
+// zwei Chargen desselben Halters miteinander verknüpfen — anders als eine
+// Ethereum-Adresse, die alle Handelsbeziehungen offenlegt.
+export pure circuit holderKey(sk: Bytes<32>, batchId: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "agri:holder:pk"), batchId, sk]);
+}
+
+circuit assertAdmin(): [] {
+  assert(roleKey(localSecretKey()) == admin, "Nur Admin");
+}
+
+circuit assertHolder(batchId: Bytes<32>): [] {
+  assert(holder.member(batchId), "Unbekannte Charge");
+  assert(holderKey(localSecretKey(), batchId) == holder.lookup(batchId), "Nicht der Halter");
+}
+
+// Lädt die privaten Daten und prüft, dass sie zum On-Chain-Commitment passen.
+// So kann niemand im Beweis "andere" Daten unterschieben als bei der
+// Registrierung festgelegt.
+circuit loadSecrets(batchId: Bytes<32>): BatchSecrets {
+  const s = batchSecrets(batchId);
+  const c = persistentCommit<BatchSecrets>(s, batchSalt(batchId));
+  assert(c == secretsCommitment.lookup(batchId), "Privatdaten passen nicht zum Commitment");
+  return s;
+}
+
+// -----------------------------------------------------------------------------
+//  Konstruktor
+// -----------------------------------------------------------------------------
+
+constructor() {
+  // PRIVAT -> ÖFFENTLICH: nur der Hash des Admin-Schlüssels wird publiziert.
+  admin = disclose(roleKey(localSecretKey()));
+  // Öffentliches Dummy-Leaf (Index 0) für ungenutzte Betriebs-Slots im
+  // EUDR-Beweis. Es ist ein bekannter Wert und erfüllt keinen Claim.
+  attestations.insert(pad(32, "agri:dummy-leaf"));
+}
+
+// -----------------------------------------------------------------------------
+//  Governance
+// -----------------------------------------------------------------------------
+
+export circuit addVerifier(verifierKey: Bytes<32>): [] {
+  assertAdmin();
+  verifiers.insert(disclose(verifierKey));
+}
+
+export circuit removeVerifier(verifierKey: Bytes<32>): [] {
+  assertAdmin();
+  verifiers.remove(disclose(verifierKey));
+}
+
+export circuit addOracleKey(keyId: Bytes<32>, pk: JubjubPoint): [] {
+  assertAdmin();
+  oracleKeys.insert(disclose(keyId), disclose(pk));
+}
+
+export circuit removeOracleKey(keyId: Bytes<32>): [] {
+  assertAdmin();
+  oracleKeys.remove(disclose(keyId));
+}
+
+// -----------------------------------------------------------------------------
+//  Prüfstelle: Betriebsbestätigung veröffentlichen
+// -----------------------------------------------------------------------------
+//  Die Prüfstelle kennt die Geodaten des Betriebs und prüft sie off-chain
+//  (Satellitenabgleich, Rechtskonformität). On-chain landet nur
+//      leaf = Commit(Claim, Salt)
+//  Ohne Salt kann niemand die Geodaten aus dem Leaf zurückrechnen, auch nicht
+//  per Brute-Force über alle bekannten HIT-Nummern.
+//  Den Salt und den Claim übergibt die Prüfstelle dem Landwirt off-chain.
+
+// Hilfsfunktion für Prüfstellen-Software: berechnet das Leaf lokal, exakt so,
+// wie der Contract es im EUDR-Beweis nachrechnet. "pure" = kein Ledgerzugriff,
+// läuft komplett offline.
+export pure circuit attestationLeaf(claim: EstablishmentClaim, salt: Bytes<32>): Bytes<32> {
+  return persistentCommit<EstablishmentClaim>(claim, salt);
+}
+
+export circuit publishAttestation(leaf: Bytes<32>): [] {
+  // ÖFFENTLICH (bewusst): Welche Prüfstelle eine Bestätigung veröffentlicht,
+  // ist sichtbar, so wie ein Prüfsiegel. Für WEN, bleibt verborgen.
+  assert(verifiers.member(disclose(roleKey(localSecretKey()))), "Keine zugelassene Pruefstelle");
+  attestations.insert(disclose(leaf));
+}
+
+// -----------------------------------------------------------------------------
+//  Charge registrieren (EPCIS: commissioning)
+// -----------------------------------------------------------------------------
+//  Wird vom Erstinverkehrbringer aufgerufen (EUDR "Operator").
+
+export circuit registerBatch(
+  batchId: Bytes<32>,
+  ddsRefCommitment: Bytes<32>,
+  thresholdEncoded: Uint<32>
+): [] {
+  const id = disclose(batchId);
+  assert(!status.member(id), "Charge existiert bereits");
+
+  // PRIVAT -> ÖFFENTLICH (nur Commitment):
+  // Geodaten, Gewicht, Preis und Lieferant werden kryptografisch gebunden,
+  // aber nicht offengelegt. Spätere Beweise müssen exakt diese Daten nutzen.
+  const s = batchSecrets(batchId);
+  secretsCommitment.insert(id, disclose(persistentCommit<BatchSecrets>(s, batchSalt(batchId))));
+
+  // ÖFFENTLICH: Pseudonym des Halters (nur für diese Charge gültig)
+  holder.insert(id, disclose(holderKey(localSecretKey(), batchId)));
+
+  // ÖFFENTLICH: Commitment auf die DDS-Referenz- und Prüfnummer aus dem
+  // EU-Informationssystem. Der Halter gibt die Klartextnummer off-chain an den
+  // nächsten Abnehmer weiter; dieser prüft sie durch Nachrechnen.
+  // So erfüllt der erste nachgelagerte Akteur seine Aufbewahrungspflicht,
+  // ohne dass die Nummer öffentlich ist.
+  ddsCommitment.insert(id, disclose(ddsRefCommitment));
+
+  status.insert(id, Status.HARVESTED);
+  isQualityCertified.insert(id, true);
+  tempThreshold.insert(id, disclose(thresholdEncoded));
+  eudrProven.insert(id, false);
+}
+
+// -----------------------------------------------------------------------------
+//  Halterwechsel in zwei Schritten (EPCIS: shipping / receiving)
+// -----------------------------------------------------------------------------
+
+export circuit ship(batchId: Bytes<32>, recipientKey: Bytes<32>): [] {
+  const id = disclose(batchId);
+  assertHolder(id);
+  assert(status.lookup(id) != Status.IN_TRANSIT, "Bereits unterwegs");
+  // recipientKey = holderKey(sk_empfaenger, batchId), vom Empfänger
+  // off-chain mitgeteilt. Öffentlich ist nur dieses Einmal-Pseudonym.
+  pendingRecipient.insert(id, disclose(recipientKey));
+  status.insert(id, Status.IN_TRANSIT);
+}
+
+export circuit acceptDelivery(batchId: Bytes<32>): [] {
+  const id = disclose(batchId);
+  assert(status.lookup(id) == Status.IN_TRANSIT, "Nicht unterwegs");
+  const me = holderKey(localSecretKey(), id);
+  assert(me == pendingRecipient.lookup(id), "Nicht der vorgesehene Empfaenger");
+  holder.insert(id, disclose(me));
+  pendingRecipient.remove(id);
+  status.insert(id, Status.DELIVERED);
+}
+
+// -----------------------------------------------------------------------------
+//  Automatisierte Qualitätsprüfung (IoT-Kühlkette)
+// -----------------------------------------------------------------------------
+//  Der Telematik-Anbieter signiert jeden Messwert mit seinem Schnorr-
+//  Schlüssel. JEDER, der eine signierte Überschreitung besitzt (Spediteur,
+//  Abnehmer, Anbieter selbst), kann sie einreichen. Der Spediteur kann eine
+//  Überschreitung also nicht unterdrücken, solange der Anbieter oder der
+//  Abnehmer die Daten ebenfalls erhält.
+//
+//  Datenschutz: Messwert und Zeitpunkt sind Parameter des Circuits und
+//  bleiben im Beweis verborgen. Öffentlich wird nur: "Charge X hat ihren
+//  Grenzwert verletzt". Unauffällige Messwerte werden gar nicht eingereicht.
+//
+//  Unveränderlichkeit: Es gibt im gesamten Contract KEINEN Circuit, der
+//  isQualityCertified wieder auf true setzt. Das ist durch Code garantiert,
+//  nicht durch eine Admin-Zusage.
+
+export circuit reportTemperatureBreach(
+  batchId: Bytes<32>,
+  oracleKeyId: Bytes<32>,
+  reading: TemperatureReading,
+  signature: JubjubSchnorrSignature
+): [] {
+  const id = disclose(batchId);
+  const kid = disclose(oracleKeyId);
+  assert(status.member(id), "Unbekannte Charge");
+  assert(oracleKeys.member(kid), "Unbekannter Telematik-Schluessel");
+
+  // Signierte Nachricht: [Domain, batchId, Temperatur, Zeitstempel]
+  const msg: Vector<4, Field> = [
+    transientHash<Bytes<32>>(pad(32, "agri:telemetry:v1")),
+    transientHash<Bytes<32>>(id),
+    reading.tempEncoded as Field,
+    reading.timestamp as Field
+  ];
+  // ZK-PRÜFUNG: Signaturprüfung findet im Beweis statt, die Signatur selbst
+  // und der Messwert werden nicht veröffentlicht.
+  assert(jubjubSchnorrVerify<4>(msg, signature, oracleKeys.lookup(kid)),
+         "Ungueltige Telematik-Signatur");
+
+  // PRIVAT -> ÖFFENTLICH: nur das Ergebnis des Vergleichs.
+  assert(disclose(reading.tempEncoded > tempThreshold.lookup(id)),
+         "Kein Grenzwertverstoss");
+
+  isQualityCertified.insert(id, false);   // Einbahnstraße
+}
+
+// -----------------------------------------------------------------------------
+//  Selective Disclosure: EUDR-Konformitätsbeweis
+// -----------------------------------------------------------------------------
+//  Was der Beweis zeigt (für Behörden, Abnehmer, Prüfer):
+//    Für JEDEN Haltungsbetrieb dieser Charge existiert eine Bestätigung einer
+//    zugelassenen Prüfstelle, dass er entwaldungsfrei und legal produziert,
+//    und diese Bestätigung war zum Stichtag `asOf` gültig.
+//
+//  Was der Beweis NICHT verrät:
+//    welche Betriebe, wo sie liegen, wie viele es sind, welche Prüfstelle
+//    bestätigt hat (Merkle-Mitgliedschaft ist anonym), Gewicht, Preis.
+//
+//  Der Beweis wird lokal erzeugt (Proof Server beim Halter). Die Midnight-
+//  Validatoren prüfen ihn bei der Transaktion; ist er ungültig, scheitert die
+//  Transaktion. Das öffentliche Ergebnis ist der Eintrag eudrProven = true.
+
+export circuit proveEudrCompliance(batchId: Bytes<32>, asOf: Uint<64>): [] {
+  const id = disclose(batchId);
+  assertHolder(id);
+
+  // Stichtag muss in den letzten 24 h liegen. Wir veröffentlichen bewusst
+  // nur diesen groben Zeitpunkt statt der exakten Gültigkeitsdaten der
+  // einzelnen Bestätigungen (die würden Rückschlüsse erlauben).
+  const day = disclose(asOf);
+  assert(blockTimeGte(day), "Stichtag liegt in der Zukunft");
+  assert(blockTimeLt((day + 86400) as Uint<64>), "Stichtag zu alt");
+
+  const s = loadSecrets(id);
+  assert(s.establishments[0].active, "Mindestens ein Betrieb erforderlich");
+
+  // DATENSCHUTZ-DETAIL: Die Merkle-Prüfung läuft für ALLE 4 Slots, auch für
+  // ungenutzte. Würde sie nur bei aktiven Betrieben laufen, verriete die
+  // Anzahl der Ledger-Operationen, wie viele Betriebe beteiligt waren.
+  // Für leere Slots liefert die Wallet den Pfad zum öffentlichen Dummy-Leaf
+  // (siehe Konstruktor); die inhaltlichen Prüfungen werden dann ignoriert.
+  for (const i of 0..4) {
+    const e = s.establishments[i];
+    const claim = attestationClaim(id, i);
+    const leaf = attestationLeaf(claim, attestationSalt(id, i));
+    const path = attestationPath(leaf);
+
+    const valid =
+      claim.hitRegNumber == e.hitRegNumber &&   // Claim gehört zu genau diesem Betrieb
+      claim.geoHash == e.geoHash &&
+      claim.deforestationFree &&                // EUDR Art. 3 a)
+      claim.legallyProduced &&                  // EUDR Art. 3 b)
+      claim.validUntil >= day &&                // zum Stichtag gültig
+      path.leaf == leaf;                        // Pfad gehört zu diesem Claim
+    assert(!e.active || valid, "EUDR-Nachweis fuer einen Betrieb fehlgeschlagen");
+
+    // ZK-MITGLIEDSCHAFTSBEWEIS: Das Leaf steckt im Merkle-Baum, ohne dass
+    // offengelegt wird, welches Leaf es ist (und damit welche Prüfstelle,
+    // welcher Betrieb). Öffentlich wird nur die Wurzel, die ohnehin bekannt ist.
+    assert(attestations.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(path))),
+           "Bestaetigung nicht im Register");
+  }
+
+  // PRIVAT -> ÖFFENTLICH: genau ein Bit plus Stichtag.
+  eudrProven.insert(id, true);
+  eudrProvenAsOf.insert(id, day);
+}
+
+// -----------------------------------------------------------------------------
+//  Selective Disclosure: Mindestmenge (Range Proof)
+// -----------------------------------------------------------------------------
+//  Beispiel für Mengenbilanz / Anti-Laundering: Ein Abnehmer will wissen,
+//  ob die Charge mindestens die gelieferte Menge abdeckt, ohne das exakte
+//  Erntegewicht (Verhandlungsposition des Landwirts) zu erfahren.
+
+export circuit proveMinWeight(batchId: Bytes<32>, minKg: Uint<32>): [] {
+  const id = disclose(batchId);
+  assertHolder(id);
+  const s = loadSecrets(id);
+  const m = disclose(minKg);
+  assert(s.netWeightKg >= m, "Mindestmenge nicht erreicht");
+  // PRIVAT -> ÖFFENTLICH: nur die bewiesene Untergrenze.
+  minWeightProven.insert(id, m);
+}
