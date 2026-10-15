@@ -58,7 +58,8 @@ import CompactStandardLibrary;
 export enum Status {
   HARVESTED,   // Erfassung/Schlachtung als Erzeugnis (commissioning)
   IN_TRANSIT,  // Versand an nächsten Halter            (shipping)
-  DELIVERED    // Empfang bestätigt                     (receiving)
+  DELIVERED,   // Empfang bestätigt                     (receiving)
+  CONSUMED     // Zerlegt oder verarbeitet              (transforming)
 }
 
 // Ein Haltungsbetrieb — PRIVAT. Verlässt nie das Gerät des Erzeugers.
@@ -123,6 +124,12 @@ export ledger eudrProven: Map<Bytes<32>, Boolean>;
 export ledger eudrProvenAsOf: Map<Bytes<32>, Uint<64>>;
 export ledger minWeightProven: Map<Bytes<32>, Uint<32>>;
 
+// Herkunft abgeleiteter Chargen (EPCIS: inputEPCList eines Transformation
+// Events). Ungenutzte Slots sind 32 Null-Bytes. Ursprungschargen aus
+// registerBatch haben keinen Eintrag. Öffentlich, damit jeder Abnehmer die
+// Kette bis zum Tier zurückgehen kann (siehe src/lineage.ts).
+export ledger inputBatches: Map<Bytes<32>, Vector<4, Bytes<32>>>;
+
 // -----------------------------------------------------------------------------
 //  WITNESSES — die Brücke zu PRIVATEN Daten
 //  Implementiert in TypeScript (witnesses.ts), läuft lokal beim Nutzer.
@@ -159,6 +166,14 @@ circuit assertAdmin(): [] {
 circuit assertHolder(batchId: Bytes<32>): [] {
   assert(holder.member(batchId), "Unbekannte Charge");
   assert(holderKey(localSecretKey(), batchId) == holder.lookup(batchId), "Nicht der Halter");
+}
+
+// 32 Null-Bytes markieren in inputBatches einen leeren Slot und sind deshalb
+// als Chargen-ID verboten. Sonst ließe sich ein Zweig der Herkunftskette
+// unsichtbar machen.
+circuit assertNewBatchId(id: Bytes<32>): [] {
+  assert(id != default<Bytes<32>>, "Ungueltige Chargen-ID");
+  assert(!status.member(id), "Charge existiert bereits");
 }
 
 // Lädt die privaten Daten und prüft, dass sie zum On-Chain-Commitment passen.
@@ -242,7 +257,7 @@ export circuit registerBatch(
   thresholdEncoded: Uint<32>
 ): [] {
   const id = disclose(batchId);
-  assert(!status.member(id), "Charge existiert bereits");
+  assertNewBatchId(id);
 
   // PRIVAT -> ÖFFENTLICH (nur Commitment):
   // Geodaten, Gewicht, Preis und Lieferant werden kryptografisch gebunden,
@@ -274,6 +289,7 @@ export circuit ship(batchId: Bytes<32>, recipientKey: Bytes<32>): [] {
   const id = disclose(batchId);
   assertHolder(id);
   assert(status.lookup(id) != Status.IN_TRANSIT, "Bereits unterwegs");
+  assert(status.lookup(id) != Status.CONSUMED, "Charge bereits verarbeitet");
   // recipientKey = holderKey(sk_empfaenger, batchId), vom Empfänger
   // off-chain mitgeteilt. Öffentlich ist nur dieses Einmal-Pseudonym.
   pendingRecipient.insert(id, disclose(recipientKey));
@@ -288,6 +304,202 @@ export circuit acceptDelivery(batchId: Bytes<32>): [] {
   holder.insert(id, disclose(me));
   pendingRecipient.remove(id);
   status.insert(id, Status.DELIVERED);
+}
+
+// -----------------------------------------------------------------------------
+//  Zerlegung und Verarbeitung (EPCIS: Transformation Events)
+// -----------------------------------------------------------------------------
+//  Ein Rind wird zu vielen Teilstücken, Teilstücke werden zu Hackfleisch
+//  gemischt. Beides ist eine Transformation: Eingangschargen werden
+//  verbraucht (Status CONSUMED), Ausgangschargen neu angelegt. Der Aufrufer
+//  muss Halter aller Eingänge sein und wird Halter aller Ausgänge.
+//
+//  Mengenbilanz: Die Ausgänge dürfen zusammen nicht schwerer sein als die
+//  Eingänge (Verluste wie Knochen und Abschnitte sind erlaubt). Geprüft wird
+//  im Beweis gegen die PRIVATEN, per Commitment gebundenen Gewichte.
+//  Öffentlich wird nur, dass die Bilanz aufgeht, keine einzige Zahl.
+//
+//  Vererbung auf die Ausgänge:
+//    * eudrProven: nur wenn ALLE Eingänge bewiesen sind. Stichtag = ältester
+//      Stichtag der Eingänge. Deshalb gilt: erst beweisen, dann mischen.
+//    * isQualityCertified: nur wenn ALLE Eingänge es zum Zeitpunkt der
+//      Transformation sind.
+//    * Kühlgrenzwert: darf nur strenger werden (z. B. Hackfleisch <= 2 °C).
+//
+//  Öffentlich ist, welche Chargen in welche übergegangen sind
+//  (inputBatches), wie im EPCIS-Standard. Privat bleiben Mengen, Preise und
+//  Betriebe.
+//
+//  Wichtig für Abnehmer: Wird eine Grenzwertüberschreitung für eine
+//  Eingangscharge erst NACH der Transformation gemeldet, ändert das die
+//  Ausgangscharge nicht automatisch (die Zahl der Nachfahren ist
+//  unbegrenzt). Wer sicher gehen will, prüft die ganze Kette
+//  (src/lineage.ts).
+
+// Zusammenfassung einer Eingangscharge beim Mischen
+struct InputSummary {
+  weight: Uint<32>;      // PRIVAT, nur für die Mengenbilanz im Beweis
+  quality: Boolean;
+  eudr: Boolean;
+  eudrAsOf: Uint<64>;
+}
+
+pure circuit minU64(x: Uint<64>, y: Uint<64>): Uint<64> {
+  return x < y ? x : y;
+}
+
+// Halter, nicht unterwegs, nicht schon verarbeitet. Weil jeder Eingang sofort
+// auf CONSUMED gesetzt wird, kann dieselbe Charge nicht zweimal in eine
+// Bilanz eingehen.
+circuit assertAvailable(id: Bytes<32>): [] {
+  assertHolder(id);
+  assert(status.lookup(id) != Status.IN_TRANSIT, "Charge ist unterwegs");
+  assert(status.lookup(id) != Status.CONSUMED, "Charge bereits verarbeitet");
+}
+
+// Legt eine Ausgangscharge an. Der Aufrufer wird ihr Halter.
+circuit registerOutput(
+  id: Bytes<32>,
+  s: BatchSecrets,
+  inputs: Vector<4, Bytes<32>>,
+  ddsRef: Bytes<32>,
+  threshold: Uint<32>,
+  quality: Boolean,
+  eudr: Boolean,
+  eudrAsOf: Uint<64>
+): [] {
+  assertNewBatchId(id);
+  // PRIVAT -> ÖFFENTLICH (nur Commitment), wie bei registerBatch
+  secretsCommitment.insert(id, disclose(persistentCommit<BatchSecrets>(s, batchSalt(id))));
+  holder.insert(id, disclose(holderKey(localSecretKey(), id)));
+  ddsCommitment.insert(id, ddsRef);
+  status.insert(id, Status.HARVESTED);
+  isQualityCertified.insert(id, quality);
+  tempThreshold.insert(id, threshold);
+  eudrProven.insert(id, eudr);
+  if (eudr) {
+    eudrProvenAsOf.insert(id, eudrAsOf);
+  }
+  inputBatches.insert(id, inputs);
+}
+
+// Ein Ausgangs-Slot beim Zerlegen. Liefert das private Gewicht des
+// Teilstücks, 0 für ungenutzte Slots.
+circuit splitOutput(
+  parentId: Bytes<32>,
+  parent: BatchSecrets,
+  childId: Bytes<32>,
+  threshold: Uint<32>,
+  active: Boolean
+): Uint<32> {
+  const id = disclose(childId);
+  const s = active ? batchSecrets(id) : default<BatchSecrets>;
+  if (active) {
+    // Teilstücke stammen von denselben Tieren: Die Betriebsliste wird
+    // übernommen, damit ein Teilstück auch selbst einen EUDR-Beweis führen
+    // kann (z. B. wenn die Ausgangscharge noch keinen hatte).
+    assert(s.establishments == parent.establishments,
+           "Teilstueck muss die Betriebe der Ausgangscharge uebernehmen");
+    const th = disclose(threshold);
+    assert(th <= tempThreshold.lookup(parentId), "Kuehlgrenzwert darf nur strenger werden");
+    const eudr = eudrProven.lookup(parentId);
+    const zero = default<Bytes<32>>;
+    registerOutput(id, s, [parentId, zero, zero, zero],
+                   ddsCommitment.lookup(parentId), th,
+                   isQualityCertified.lookup(parentId),
+                   eudr, eudr ? eudrProvenAsOf.lookup(parentId) : 0);
+  }
+  return active ? s.netWeightKg : 0;
+}
+
+// Zerlegung: eine Charge -> 1 bis 4 Teilstücke. Mehr Teilstücke entstehen
+// durch weitere Zerlegung der Ausgänge. Eine Zerlegung in 1 Teil ist eine
+// Umverpackung (neue SSCC).
+// Ungenutzte Einträge in childIds und thresholds werden ignoriert.
+export circuit splitBatch(
+  parentId: Bytes<32>,
+  childIds: Vector<4, Bytes<32>>,
+  thresholds: Vector<4, Uint<32>>,
+  childCount: Uint<8>
+): [] {
+  const pid = disclose(parentId);
+  const n = disclose(childCount);
+  assert(n >= 1 && n <= 4, "1 bis 4 Teilstuecke je Zerlegung");
+  assertAvailable(pid);
+  const p = loadSecrets(pid);
+  status.insert(pid, Status.CONSUMED);
+
+  const w0 = splitOutput(pid, p, childIds[0], thresholds[0], true);
+  const w1 = splitOutput(pid, p, childIds[1], thresholds[1], n > 1);
+  const w2 = splitOutput(pid, p, childIds[2], thresholds[2], n > 2);
+  const w3 = splitOutput(pid, p, childIds[3], thresholds[3], n > 3);
+
+  // MENGENBILANZ im Beweis: Summe der privaten Teilgewichte <= privates
+  // Gewicht der Ausgangscharge.
+  assert(w0 + w1 + w2 + w3 <= p.netWeightKg,
+         "Mengenbilanz verletzt: Ausgaenge schwerer als Eingang");
+}
+
+// Ein Eingangs-Slot beim Mischen: prüfen, verbrauchen, zusammenfassen.
+// Ungenutzte Slots sind neutral (Gewicht 0, Status "gut", Stichtag maximal),
+// damit sie UND-Verknüpfung und Minimum nicht verfälschen.
+circuit consumeInput(parentId: Bytes<32>, threshold: Uint<32>, active: Boolean): InputSummary {
+  const pid = disclose(parentId);
+  if (active) {
+    assertAvailable(pid);
+    assert(threshold <= tempThreshold.lookup(pid), "Kuehlgrenzwert darf nur strenger werden");
+    status.insert(pid, Status.CONSUMED);
+  }
+  const s = active ? loadSecrets(pid) : default<BatchSecrets>;
+  const eudr = active ? eudrProven.lookup(pid) : true;
+  return InputSummary {
+    weight: s.netWeightKg,
+    quality: active ? isQualityCertified.lookup(pid) : true,
+    eudr: eudr,
+    eudrAsOf: !active ? 18446744073709551615 : (eudr ? eudrProvenAsOf.lookup(pid) : 0)
+  };
+}
+
+// Verarbeitung: 2 bis 4 Chargen -> eine Mischcharge (z. B. Hackfleisch).
+// Größere Mischungen entstehen durch Mischen von Mischchargen.
+// Mischchargen führen keine eigene Betriebsliste (sie hätte schnell mehr als
+// 4 Einträge). Ihre Herkunft sind ausschließlich die Eingangschargen; der
+// EUDR-Status wird nur vererbt.
+// ddsRefCommitment bindet die Liste der DDS-Referenzen aller Eingänge.
+export circuit mergeBatches(
+  parentIds: Vector<4, Bytes<32>>,
+  parentCount: Uint<8>,
+  childId: Bytes<32>,
+  ddsRefCommitment: Bytes<32>,
+  thresholdEncoded: Uint<32>
+): [] {
+  const n = disclose(parentCount);
+  assert(n >= 2 && n <= 4, "2 bis 4 Eingangschargen je Mischung");
+  const th = disclose(thresholdEncoded);
+  const a = consumeInput(parentIds[0], th, true);
+  const b = consumeInput(parentIds[1], th, true);
+  const c = consumeInput(parentIds[2], th, n > 2);
+  const d = consumeInput(parentIds[3], th, n > 3);
+
+  const id = disclose(childId);
+  const s = batchSecrets(id);
+  // MENGENBILANZ im Beweis: privates Gewicht des Ausgangs <= Summe der
+  // privaten Gewichte der Eingänge.
+  assert(s.netWeightKg <= a.weight + b.weight + c.weight + d.weight,
+         "Mengenbilanz verletzt: Ausgang schwerer als Eingaenge");
+  for (const i of 0..4) {
+    assert(!s.establishments[i].active, "Mischcharge darf keine eigenen Betriebe angeben");
+  }
+
+  const zero = default<Bytes<32>>;
+  const eudr = a.eudr && b.eudr && c.eudr && d.eudr;
+  registerOutput(id, s,
+                 [disclose(parentIds[0]), disclose(parentIds[1]),
+                  n > 2 ? disclose(parentIds[2]) : zero,
+                  n > 3 ? disclose(parentIds[3]) : zero],
+                 disclose(ddsRefCommitment), th,
+                 a.quality && b.quality && c.quality && d.quality,
+                 eudr, minU64(minU64(a.eudrAsOf, b.eudrAsOf), minU64(c.eudrAsOf, d.eudrAsOf)));
 }
 
 // -----------------------------------------------------------------------------

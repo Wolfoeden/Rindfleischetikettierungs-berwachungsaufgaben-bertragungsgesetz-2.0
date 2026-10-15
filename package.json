@@ -16,7 +16,7 @@
   "scripts": {
     "compile": "compact compile src/CattleTrace.compact build",
     "compile:fast": "compact compile --skip-zk src/CattleTrace.compact build",
-    "test": "tsx test/simulation.test.ts",
+    "test": "tsx test/simulation.test.ts && tsx test/transformation.test.ts",
     "typecheck": "tsc"
   }
 }

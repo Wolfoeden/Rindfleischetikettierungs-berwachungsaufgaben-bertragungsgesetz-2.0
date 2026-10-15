@@ -2,42 +2,14 @@
 // Ausführen: npx tsx test/simulation.test.ts
 import * as rt from '@midnight-ntwrk/compact-runtime';
 import { strict as assert } from 'node:assert';
-import { randomBytes } from 'node:crypto';
-import { Contract, ledger, Status, pureCircuits } from '../build/contract/index.js';
-import { witnesses, createPrivateState, type CattleTracePrivateState } from '../src/witnesses.js';
-
-const COIN_PK = '0'.repeat(64);
-const ADDR = rt.sampleContractAddress();
-const contract = new Contract(witnesses);
-const b32 = () => new Uint8Array(randomBytes(32));
-const pad32 = (s: string) => { const o = new Uint8Array(32); o.set(new TextEncoder().encode(s)); return o; };
+import { Status, pureCircuits } from '../build/contract/index.js';
+import { createHarness, expectFail, b32, pad32, roleKey } from './harness.js';
 
 // Rollen = verschiedene geheime Schlüssel
 const skAdmin = b32(), skPruefstelle = b32(), skBauer = b32(), skSchlachthof = b32();
-const ps: CattleTracePrivateState = createPrivateState(skAdmin);
-
-let now = 1_790_000_000; // Unix-Sekunden (Okt. 2026)
-const init = await contract.initialState(rt.createConstructorContext(ps, COIN_PK));
-let state: any = init.currentContractState;
-
-async function call(name: string, sk: Uint8Array, ...args: any[]) {
-  ps.secretKey = sk;
-  const ctx = rt.createCircuitContext({
-    circuitId: name, contractAddress: ADDR, coinPublicKeyOrZswapState: COIN_PK,
-    contractState: state, privateState: ps, time: now,
-  });
-  const res = await (contract.impureCircuits as any)[name](ctx, ...args);
-  state = res.context.queryContexts[ADDR]?.state ?? res.context.callContext.currentQueryContext.state;
-  return res.result;
-}
-const L = () => ledger(state);
-async function expectFail(p: Promise<unknown>, msg: string) {
-  await assert.rejects(p, (e: any) => String(e?.message ?? e).includes(msg), `erwartet: ${msg}`);
-}
+const { ps, now, call, L } = await createHarness(skAdmin);
 
 // --- Governance ---------------------------------------------------------------
-const roleKey = (sk: Uint8Array) => rt.persistentHash(
-  new rt.CompactTypeVector(2, new rt.CompactTypeBytes(32)), [pad32('agri:role:pk'), sk]);
 await call('addVerifier', skAdmin, roleKey(skPruefstelle));
 await expectFail(call('addVerifier', skBauer, roleKey(skBauer)), 'Nur Admin');
 

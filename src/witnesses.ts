@@ -13,6 +13,7 @@ import type { WitnessContext } from '@midnight-ntwrk/compact-runtime';
 import type {
   Ledger,
   BatchSecrets,
+  Establishment,
   EstablishmentClaim,
   Witnesses,
 } from '../build/contract/index.js';
@@ -91,5 +92,38 @@ export const createPrivateState = (secretKey: Uint8Array): CattleTracePrivateSta
   if (secretKey.length !== 32) throw new Error('secretKey muss 32 Byte haben');
   return { secretKey, batches: {} };
 };
+
+// --- Private Datensätze für Zerlegung und Verarbeitung -----------------------
+// Vor splitBatch/mergeBatches unter dem Schlüssel hex(childId) in
+// privateState.batches ablegen.
+
+/** Gewicht, Preis, Lieferant einer Ausgangscharge (die Betriebe regelt der Contract). */
+export type OutputData = Omit<BatchSecrets, 'establishments'>;
+
+const EMPTY_ESTABLISHMENT: Establishment = {
+  active: false,
+  hitRegNumber: new Uint8Array(32),
+  geoHash: new Uint8Array(32),
+};
+
+const randomSalt = () => crypto.getRandomValues(new Uint8Array(32));
+
+/**
+ * Teilstück aus einer Zerlegung. Betriebe und Prüfstellen-Bestätigungen
+ * werden von der Ausgangscharge übernommen (der Contract erzwingt das), damit
+ * das Teilstück später auch selbst einen EUDR-Beweis führen kann.
+ */
+export const splitRecord = (parent: BatchPrivateRecord, data: OutputData): BatchPrivateRecord => ({
+  secrets: { ...data, establishments: parent.secrets.establishments },
+  salt: randomSalt(),
+  attestations: parent.attestations,
+});
+
+/** Mischcharge: keine eigene Betriebsliste (der Contract erzwingt das). */
+export const mergeRecord = (data: OutputData): BatchPrivateRecord => ({
+  secrets: { ...data, establishments: Array(SLOTS).fill(EMPTY_ESTABLISHMENT) },
+  salt: randomSalt(),
+  attestations: Array(SLOTS).fill(null),
+});
 
 export { SLOTS };
