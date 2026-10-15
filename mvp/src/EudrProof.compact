@@ -1,0 +1,205 @@
+// =============================================================================
+//  EudrProof.compact — MVP: Entwaldungsnachweis ohne Offenlegung der Betriebe
+//  Referenz-Implementierung · Apache-2.0
+//
+//  Ausschnitt aus src/CattleTrace.compact (nur der EUDR-Teil), gebaut für den
+//  stabilen Midnight-Stand: compactc 0.31.0, Sprache 0.23, Ledger 8.
+//
+//  Ablauf
+//  ------
+//  1. Admin lässt eine Prüfstelle zu.
+//  2. Die Prüfstelle prüft einen Betrieb off-chain (Koordinaten gegen
+//     Waldkarten / Satellitendaten) und veröffentlicht nur ein Commitment.
+//  3. Der Erstinverkehrbringer registriert eine Partie und bindet die
+//     Betriebsliste per Commitment, ohne sie offenzulegen.
+//  4. Er beweist lokal: Jeder Betrieb der Partie ist von einer zugelassenen
+//     Prüfstelle als entwaldungsfrei und legal bestätigt. Öffentlich wird
+//     nur eudrProven = true und der Stichtag.
+//
+//  Alles mit `export ledger` ist ÖFFENTLICH. Alles aus einem `witness` ist
+//  PRIVAT und verlässt das Gerät nur als Zero-Knowledge-Beweis. Jedes
+//  `disclose` ist eine bewusste Freigabe.
+// =============================================================================
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// -----------------------------------------------------------------------------
+//  Typen
+// -----------------------------------------------------------------------------
+
+// Ein Haltungsbetrieb — PRIVAT. Format der Felder: siehe src/encoding.ts.
+export struct Establishment {
+  active: Boolean;          // false = Slot ungenutzt
+  hitRegNumber: Bytes<32>;  // Registriernummer in der HI-Tier-Datenbank
+  geoHash: Bytes<32>;       // Fingerabdruck des Koordinatenpunkts
+}
+
+// Private Daten einer Partie. On-chain liegt nur ein Commitment davon.
+// Max. 4 Betriebe (Geburt -> Aufzucht -> Mast -> ggf. Sammelstelle).
+export struct BatchSecrets {
+  establishments: Vector<4, Establishment>;
+}
+
+// Was eine Prüfstelle über EINEN Betrieb bestätigt.
+export struct EstablishmentClaim {
+  hitRegNumber: Bytes<32>;
+  geoHash: Bytes<32>;
+  deforestationFree: Boolean;  // keine Entwaldung nach dem 31.12.2020 (Art. 3 a)
+  legallyProduced: Boolean;    // legal nach dem Recht des Erzeugerlandes (Art. 3 b)
+  validUntil: Uint<64>;        // Unix-Sekunden
+}
+
+// -----------------------------------------------------------------------------
+//  ÖFFENTLICHER ZUSTAND
+// -----------------------------------------------------------------------------
+
+export ledger admin: Bytes<32>;                       // Hash des Admin-Schlüssels
+export ledger verifiers: Set<Bytes<32>>;              // zugelassene Prüfstellen
+export ledger attestations: HistoricMerkleTree<16, Bytes<32>>; // Bestätigungen (nur Commitments)
+
+// Partien, Schlüssel = batchId (z. B. SSCC, auf 32 Byte)
+export ledger holder: Map<Bytes<32>, Bytes<32>>;            // Pseudonym, pro Partie neu
+export ledger secretsCommitment: Map<Bytes<32>, Bytes<32>>; // bindet die Betriebsliste
+export ledger eudrProven: Map<Bytes<32>, Boolean>;
+export ledger eudrProvenAsOf: Map<Bytes<32>, Uint<64>>;
+
+// -----------------------------------------------------------------------------
+//  WITNESSES (src/witnesses.ts, laufen lokal beim Nutzer)
+// -----------------------------------------------------------------------------
+
+witness localSecretKey(): Bytes<32>;
+witness batchSecrets(batchId: Bytes<32>): BatchSecrets;
+witness batchSalt(batchId: Bytes<32>): Bytes<32>;
+witness attestationSalt(batchId: Bytes<32>, slot: Uint<8>): Bytes<32>;
+witness attestationClaim(batchId: Bytes<32>, slot: Uint<8>): EstablishmentClaim;
+witness attestationPath(leaf: Bytes<32>): MerkleTreePath<16, Bytes<32>>;
+
+// -----------------------------------------------------------------------------
+//  Hilfs-Circuits
+// -----------------------------------------------------------------------------
+
+// Rollen-Schlüssel (Admin, Prüfstelle): bewusst stabil und wiedererkennbar.
+circuit roleKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "agri:role:pk"), sk]);
+}
+
+// Halter-Pseudonym PRO PARTIE: Zwei Partien desselben Halters lassen sich
+// nicht miteinander verknüpfen.
+export pure circuit holderKey(sk: Bytes<32>, batchId: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "agri:holder:pk"), batchId, sk]);
+}
+
+// Leaf einer Prüfstellen-Bestätigung. "pure": läuft offline in der Software
+// der Prüfstelle und exakt so im EUDR-Beweis.
+export pure circuit attestationLeaf(claim: EstablishmentClaim, salt: Bytes<32>): Bytes<32> {
+  return persistentCommit<EstablishmentClaim>(claim, salt);
+}
+
+circuit assertAdmin(): [] {
+  assert(roleKey(localSecretKey()) == admin, "Nur Admin");
+}
+
+// -----------------------------------------------------------------------------
+//  Konstruktor und Governance
+// -----------------------------------------------------------------------------
+
+constructor() {
+  // PRIVAT -> ÖFFENTLICH: nur der Hash des Admin-Schlüssels.
+  admin = disclose(roleKey(localSecretKey()));
+  // Öffentliches Dummy-Leaf (Index 0) für ungenutzte Betriebs-Slots.
+  attestations.insert(pad(32, "agri:dummy-leaf"));
+}
+
+export circuit addVerifier(verifierKey: Bytes<32>): [] {
+  assertAdmin();
+  verifiers.insert(disclose(verifierKey));
+}
+
+export circuit removeVerifier(verifierKey: Bytes<32>): [] {
+  assertAdmin();
+  verifiers.remove(disclose(verifierKey));
+}
+
+// -----------------------------------------------------------------------------
+//  Prüfstelle: Bestätigung veröffentlichen
+// -----------------------------------------------------------------------------
+//  On-chain landet nur leaf = Commit(Claim, Salt). Ohne Salt lassen sich
+//  Betrieb und Koordinaten nicht zurückrechnen. Claim und Salt übergibt die
+//  Prüfstelle dem Betrieb off-chain.
+
+export circuit publishAttestation(leaf: Bytes<32>): [] {
+  // ÖFFENTLICH (bewusst): Welche Prüfstelle veröffentlicht, ist sichtbar wie
+  // ein Prüfsiegel. Für WEN, bleibt verborgen.
+  assert(verifiers.member(disclose(roleKey(localSecretKey()))), "Keine zugelassene Pruefstelle");
+  attestations.insert(disclose(leaf));
+}
+
+// -----------------------------------------------------------------------------
+//  Partie registrieren
+// -----------------------------------------------------------------------------
+
+export circuit registerBatch(batchId: Bytes<32>): [] {
+  const id = disclose(batchId);
+  assert(id != default<Bytes<32>>, "Ungueltige Partie-ID");
+  assert(!holder.member(id), "Partie existiert bereits");
+  // PRIVAT -> ÖFFENTLICH (nur Commitment): Betriebe und Koordinaten werden
+  // gebunden, aber nicht offengelegt. Der Beweis muss genau diese nutzen.
+  const s = batchSecrets(batchId);
+  secretsCommitment.insert(id, disclose(persistentCommit<BatchSecrets>(s, batchSalt(batchId))));
+  holder.insert(id, disclose(holderKey(localSecretKey(), batchId)));
+  eudrProven.insert(id, false);
+}
+
+// -----------------------------------------------------------------------------
+//  EUDR-Konformitätsbeweis
+// -----------------------------------------------------------------------------
+//  Zeigt: Für JEDEN Betrieb der Partie gibt es eine Bestätigung einer
+//  zugelassenen Prüfstelle (entwaldungsfrei, legal, zum Stichtag gültig).
+//  Verrät NICHT: welche Betriebe, wo sie liegen, wie viele es sind, welche
+//  Prüfstelle bestätigt hat.
+
+export circuit proveEudrCompliance(batchId: Bytes<32>, asOf: Uint<64>): [] {
+  const id = disclose(batchId);
+  assert(holder.member(id), "Unbekannte Partie");
+  assert(holderKey(localSecretKey(), id) == holder.lookup(id), "Nicht der Halter");
+
+  // Stichtag muss in den letzten 24 h liegen.
+  const day = disclose(asOf);
+  assert(blockTimeGte(day), "Stichtag liegt in der Zukunft");
+  assert(blockTimeLt((day + 86400) as Uint<64>), "Stichtag zu alt");
+
+  const s = batchSecrets(id);
+  assert(persistentCommit<BatchSecrets>(s, batchSalt(id)) == secretsCommitment.lookup(id),
+         "Privatdaten passen nicht zum Commitment");
+  assert(s.establishments[0].active, "Mindestens ein Betrieb erforderlich");
+
+  // Die Prüfung läuft für ALLE 4 Slots, auch ungenutzte, damit die Zahl der
+  // Ledger-Operationen nicht verrät, wie viele Betriebe beteiligt sind. Für
+  // leere Slots liefert die Wallet den Pfad zum öffentlichen Dummy-Leaf.
+  for (const i of 0..4) {
+    const e = s.establishments[i];
+    const claim = attestationClaim(id, i);
+    const leaf = attestationLeaf(claim, attestationSalt(id, i));
+    const path = attestationPath(leaf);
+
+    const valid =
+      claim.hitRegNumber == e.hitRegNumber &&
+      claim.geoHash == e.geoHash &&
+      claim.deforestationFree &&
+      claim.legallyProduced &&
+      claim.validUntil >= day &&
+      path.leaf == leaf;
+    assert(!e.active || valid, "EUDR-Nachweis fuer einen Betrieb fehlgeschlagen");
+
+    // Mitgliedschaftsbeweis: Das Leaf steckt im Register, ohne dass verraten
+    // wird, welches es ist. Öffentlich wird nur die (bekannte) Wurzel.
+    assert(attestations.checkRoot(disclose(merkleTreePathRoot<16, Bytes<32>>(path))),
+           "Bestaetigung nicht im Register");
+  }
+
+  // PRIVAT -> ÖFFENTLICH: genau ein Bit plus Stichtag.
+  eudrProven.insert(id, true);
+  eudrProvenAsOf.insert(id, day);
+}

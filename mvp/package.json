@@ -1,0 +1,25 @@
+{
+  "name": "cattle-trace-eudr-mvp",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "MVP: EUDR-Entwaldungsnachweis ohne Offenlegung der Betriebe (Midnight, Compact)",
+  "license": "Apache-2.0",
+  "scripts": {
+    "compile": "compact compile src/EudrProof.compact build",
+    "compile:fast": "compact compile --skip-zk src/EudrProof.compact build",
+    "test": "tsx test/eudr.test.ts",
+    "typecheck": "tsc",
+    "measure": "tsx scripts/measure-proof.ts"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.16.0",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.1",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

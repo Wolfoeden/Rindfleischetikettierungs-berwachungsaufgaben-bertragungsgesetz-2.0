@@ -8,6 +8,8 @@ Zero-Knowledge-Beweisen statt offengelegter Betriebsdaten.
 
 Getestet mit `compactc 0.35.0` (Sprache 0.27.0) und `@midnight-ntwrk/compact-runtime 0.20.0`.
 
+**Erster Use Case zum Veröffentlichen:** [`mvp/`](mvp/README.md) enthält nur den Entwaldungsnachweis. Er ist für den stabilen Midnight-Stand gebaut und mit echten Zero-Knowledge-Beweisen getestet.
+
 ## Was öffentlich ist, was privat bleibt
 
 | Öffentlich (Ledger) | Privat (nur beim Halter) |
